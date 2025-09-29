@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Off-board Classification</title>
+  <title>Off-board Classification (dumpData)</title>
   <style>
     body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 16px}
     button{padding:10px 14px;margin:6px 8px 6px 0}
@@ -12,6 +12,7 @@
     #calInfo{margin-left:8px;font-style:italic}
     canvas{max-width:700px}
   </style>
+  <!-- Charting + Modell -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.9.4/Chart.js"></script>
   <script src="model.js"></script>
 </head>
@@ -31,14 +32,14 @@
     <span id="calInfo"></span>
   </p>
 
-  <textarea id="sensordata" placeholder="Letzte CSV-Zeilen …"></textarea>
+  <textarea id="sensordata" placeholder="CSV (60 ints: 20×x,y,z) …"></textarea>
   <div id="result" style="margin-top:8px;font-weight:bold;"></div>
   <canvas id="myChart"></canvas>
 
   <!-- UART.js (WebBluetooth helper) -->
   <script src="https://www.espruino.com/js/uart.js"></script>
   <script>
-  // UI refs
+  // --- UI refs
   const $connect = document.getElementById('btnConnect');
   const $fetch   = document.getElementById('btnFetch');
   const $auto    = document.getElementById('autoChk');
@@ -49,13 +50,11 @@
   const $cal     = document.getElementById('btnCal');
   const $calInfo = document.getElementById('calInfo');
 
-  // State
+  // --- State
   let connection = null;
   let autoTimer = null;
-  let lineBuf = "";
-  let sampleBuf = []; // hält kontinuierlich die letzten 60 Werte (20×x,y,z)
 
-  // Kalibrierung (Offsets in ±127)
+  // Calibration offsets (in ±127)
   let ox=0, oy=0, oz=0;
   let calMode=false, calN=0, sx=0, sy=0, sz=0;
 
@@ -65,21 +64,24 @@
     $auto.disabled    = !on;
     $disc.disabled    = !on;
     $cal.disabled     = !on;
-    $status.textContent = on ? "Connected (streaming…)" : "Not connected";
+    $status.textContent = on ? "Connected" : "Not connected";
+
     if (!on){
       $auto.checked = false;
       if (autoTimer){ clearInterval(autoTimer); autoTimer=null; }
       $calInfo.textContent = "";
-      lineBuf=""; sampleBuf=[];
     }
   }
 
-  // RAW->±127
-  const SCALE = 127/16384;
-  function to127(v){ v = Math.round(v*SCALE); if(v>127)v=127; if(v<-127)v=-127; return v|0; }
-  function clamp127(v){ if(v>127)return 127; if(v<-127)return -127; return v|0; }
+  // --- Robust: aus beliebigem String die letzten 60 ints ziehen
+  function parseCSV60(response){
+    if (!response || typeof response !== "string") return null;
+    const nums = (response.match(/-?\d+/g) || []).map(n => parseInt(n,10));
+    if (nums.length < 60) return null;
+    return nums.slice(-60);
+  }
 
-  // Plot
+  // --- Plot (x/y/z über 20 Samples)
   let chart = null;
   function plotWindow(data){
     const xs=[], ys=[], zs=[];
@@ -104,106 +106,89 @@
     });
   }
 
-  // Zeilen aus dem Stream verarbeiten
-  function handleLine(l){
-    const parts = l.trim().split(",");
-    if (parts.length !== 3) return;
-    const x0 = to127(parseInt(parts[0],10));
-    const y0 = to127(parseInt(parts[1],10));
-    const z0 = to127(parseInt(parts[2],10));
+  function clamp127(v){ if(v>127)return 127; if(v<-127)return -127; return v|0; }
 
-    if (calMode){ sx+=x0; sy+=y0; sz+=z0; calN++; }
-
+  // --- Klassifikation mit Offsets
+  function classifyAndShow(raw60){
     // Offsets abziehen
-    const x = clamp127(x0 - ox), y = clamp127(y0 - oy), z = clamp127(z0 - oz);
-
-    // In den Ringpuffer: nur die letzten 60 Werte behalten
-    sampleBuf.push(x,y,z);
-    if (sampleBuf.length > 60) sampleBuf = sampleBuf.slice(sampleBuf.length-60);
-
-    // Textarea: letzte CSV-Zeilen zeigen
-    const lines = $sens.value.split(/\r?\n/).slice(-8);
-    lines.push(`${x},${y},${z}`);
-    $sens.value = lines.join("\n");
-  }
-
-  // Klassifikation eines 20×3 Fensters
-  function classifyCurrentWindow(){
-    if (sampleBuf.length < 60){
-      $result.textContent = "Zu wenig Daten – kurz warten …";
-      return;
+    const adj = raw60.slice();
+    for (let i=0;i<20;i++){
+      adj[3*i]   = clamp127(adj[3*i]   - ox);
+      adj[3*i+1] = clamp127(adj[3*i+1] - oy);
+      adj[3*i+2] = clamp127(adj[3*i+2] - oz);
     }
-    const window60 = sampleBuf.slice(-60); // aktuelles Fenster
-    const out = classify(window60); // aus model.js
+
+    // Model aufrufen (kommt aus model.js)
+    const out = classify(adj);
     const labels = ["random","up-down","sideways"];
     const idx = out.indexOf(Math.max(...out));
     $result.textContent = `Classifier: ${labels[idx]}  (raw=[${out.join(", ")}])`;
-    plotWindow(window60);
+
+    plotWindow(adj);
   }
 
-  // Streaming-Code an den Puck schicken (läuft bis Disconnect)
-  function sendStreamerCode(){
-    const code = `
-reset();
-setTimeout(function(){
-  var HZ=12.5, DT=80;
-  Puck.accelOn(HZ);
-  setInterval(function(){
-    var d=Puck.accel(),a=(d&&d.acc)?d.acc:d;
-    if(a) Bluetooth.println((a.x|0)+","+(a.y|0)+","+(a.z|0));
-  }, DT);
-  NRF.on('disconnect', function(){ reset(); });
-}, 300);
-`;
-    connection.write("\x03" + code + "\n"); // Ctrl-C, dann Code
+  // --- Einmaliges Holen (BLE bleibt offen)
+  function fetchOnce(){
+    UART.eval('dumpData()', function(response) {
+      $sens.value = response || "";
+      const arr = parseCSV60(response);
+      if (!arr){
+        $result.textContent = "Zu wenig Daten – kurz warten und erneut klicken.";
+        return;
+      }
+
+      // während Kalibrierung die Mittelwerte sammeln (über das ganze 20er-Fenster)
+      if (calMode){
+        let sxw=0, syw=0, szw=0;
+        for (let i=0;i<20;i++){
+          sxw += arr[3*i]; syw += arr[3*i+1]; szw += arr[3*i+2];
+        }
+        sx += Math.round(sxw/20);
+        sy += Math.round(syw/20);
+        sz += Math.round(szw/20);
+        calN++;
+      }
+
+      classifyAndShow(arr);
+    });
   }
 
-  // Events
+  // --- Events
   $connect.onclick = async () => {
     try{
       // Wichtig: Espruino Web IDE muss getrennt sein.
       connection = await UART.connect();
       setConnectedUI(true);
-
-      // Datenstrom lesen
-      connection.on('data', d => {
-        lineBuf += d;
-        const lines = lineBuf.split(/\r?\n/);
-        lineBuf = lines.pop();
-        lines.forEach(handleLine);
-      });
-
-      // Stream auf dem Puck starten
-      sendStreamerCode();
     }catch(e){
       $status.textContent = "Connect failed: " + e.message;
     }
   };
 
-  $fetch.onclick = () => classifyCurrentWindow();
+  $fetch.onclick = () => fetchOnce();
 
   $auto.onchange = () => {
     if ($auto.checked){
-      autoTimer = setInterval(classifyCurrentWindow, 1600); // ~20 Samples @12.5 Hz
-      classifyCurrentWindow();
-    }else{
+      autoTimer = setInterval(fetchOnce, 1600); // ~20 Samples @ 12.5 Hz
+      fetchOnce();
+    } else {
       if (autoTimer){ clearInterval(autoTimer); autoTimer=null; }
     }
   };
 
   $disc.onclick = () => {
     try{ if (connection) connection.close(); }catch(_){}
-    connection=null;
+    connection = null;
     setConnectedUI(false);
   };
 
-  // Kalibrierung
+  // --- Kalibrierung
   $cal.onclick = () => {
     calMode = true; calN=0; sx=sy=sz=0;
     $calInfo.textContent = "Calibrating… keep still";
     setTimeout(()=>{
       if (calN>0){
         ox = Math.round(sx/calN);
+        oy = Math.round(oy + sy/calN - oy); // stabilize assignment
         oy = Math.round(sy/calN);
         oz = Math.round(sz/calN);
         $calInfo.textContent = `Offsets set: ox=${ox}, oy=${oy}, oz=${oz}`;
