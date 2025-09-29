@@ -2,81 +2,51 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>UbiComp Assignment – Offboard</title>
+  <title>UbiComp Assignment – Offboard (Streaming)</title>
   <style>
     body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 16px}
     button{padding:10px 14px;margin:6px 8px 6px 0}
-    label{margin-left:8px}
-    #sensordata{width:100%;height:80px}
     #status{display:inline-block;margin-left:8px;font-weight:600}
+    #sensordata{width:100%;height:70px}
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.9.4/Chart.js"></script>
   <script src="model.js"></script>
 </head>
 <body>
-  <h1>Off-board Classification</h1>
+  <h1>Off-board Classification (Live Stream)</h1>
 
   <p>
-    <button id="btnConnect">Connect</button>
-    <button id="btnFetch" disabled>Fetch 20 samples</button>
-    <label><input type="checkbox" id="autoChk" disabled /> Auto (1.6 s)</label>
+    <button id="btnConnect">Connect & Start Stream</button>
     <button id="btnDisconnect" disabled>Disconnect</button>
     <span id="status">Not connected</span>
   </p>
 
-  <textarea id="sensordata" placeholder="CSV (60 Zahlen) …"></textarea>
-  <div id="result" style="margin-top:1em;font-weight:bold;"></div>
+  <div id="result" style="margin-top:8px;font-weight:bold;"></div>
+  <textarea id="sensordata" placeholder="Letzte CSV-Zeilen …"></textarea>
   <canvas id="myChart" style="width:100%;max-width:700px;margin-top:12px;"></canvas>
 
   <!-- UART.js: WebBluetooth helper -->
   <script src="https://www.espruino.com/js/uart.js"></script>
   <script>
-  // ---- UI handles
   const $connect = document.getElementById('btnConnect');
-  const $fetch   = document.getElementById('btnFetch');
-  const $auto    = document.getElementById('autoChk');
   const $disc    = document.getElementById('btnDisconnect');
   const $status  = document.getElementById('status');
   const $sens    = document.getElementById('sensordata');
   const $result  = document.getElementById('result');
 
-  // ---- State
   let connection = null;
-  let autoTimer = null;
+  let lineBuf = "";
+  let sampleBuf = []; // hält jeweils 60 Werte (20×x,y,z)
 
   function setConnectedUI(on){
-    $fetch.disabled = !on;
-    $disc.disabled  = !on;
-    $auto.disabled  = !on;
     $connect.disabled = on;
-    $status.textContent = on ? "Connected" : "Not connected";
-    if (!on) {
-      $auto.checked = false;
-      if (autoTimer){ clearInterval(autoTimer); autoTimer=null; }
-    }
+    $disc.disabled    = !on;
+    $status.textContent = on ? "Connected (streaming…)" : "Not connected";
   }
 
-  // ---- CSV -> Array[60 int]
-  function extractDataFromResponse(response){
-    if (!response || typeof response !== "string") return null;
-    const arr = response.split(",")
-      .map(s => parseInt(s,10))
-      .filter(n => Number.isFinite(n));
-    return (arr.length === 60) ? arr : null;
-  }
-
-  // ---- Classification & display
-  function doClassification(data){
-    const out = classify(data); // aus model.js
-    const labels = ["random","up-down","sideways"];
-    const idx = out.indexOf(Math.max(...out));
-    $result.textContent = `Classifier: ${labels[idx]}  (raw=[${out.join(", ")}])`;
-  }
-
-  // ---- Plot (optional)
+  // ---- Plot
   let chart = null;
-  function makeChart(data){
-    if (!data) return;
+  function plotWindow(data){
     const xs=[], ys=[], zs=[];
     for (let i=0;i<20;i++){
       xs.push(data[3*i]);
@@ -99,49 +69,87 @@
     });
   }
 
-  // ---- Fetch ohne Verbindung zu schließen
-  function fetchOnce(){
-    UART.eval('dumpData()', function(response) {
-      $sens.value = response || "";
-      const data = extractDataFromResponse(response);
-      if (!data){
-        $result.textContent = "Zu wenig Daten – kurz warten und erneut klicken.";
-        return;
-      }
-      makeChart(data);
-      doClassification(data);
-    });
+  // ---- RAW -> ±127 (±2g) wie im Assignment
+  const SCALE = 127/16384;
+  function to127(v){ v = Math.round(v*SCALE); if(v>127)v=127; if(v<-127)v=-127; return v|0; }
+
+  // ---- CSV-Zeilen aus dem Stream verarbeiten
+  function handleLine(l){
+    // erwartet "x,y,z" (RAW ints)
+    const parts = l.trim().split(",");
+    if (parts.length !== 3) return;
+    const x = to127(parseInt(parts[0],10));
+    const y = to127(parseInt(parts[1],10));
+    const z = to127(parseInt(parts[2],10));
+    sampleBuf.push(x,y,z);
+
+    // Zeige die letzten paar CSVs im Textfeld
+    const lines = $sens.value.split(/\r?\n/).slice(-8);
+    lines.push(l.trim());
+    $sens.value = lines.join("\n");
+
+    // Wenn 60 Werte (20 Samples) voll sind: klassifizieren & Puffer leeren
+    if (sampleBuf.length >= 60){
+      const window60 = sampleBuf.slice(0,60);
+      sampleBuf = sampleBuf.slice(60); // Falls du gleitendes Fenster willst, ändere das auf slice(3) usw.
+
+      // Klassifizieren
+      const out = classify(window60); // aus model.js
+      const labels = ["random","up-down","sideways"];
+      const idx = out.indexOf(Math.max(...out));
+      $result.textContent = `Classifier: ${labels[idx]}  (raw=[${out.join(", ")}])`;
+
+      // Plot
+      plotWindow(window60);
+    }
   }
 
-  // ---- Events
+  // ---- Beim Connect: Streaming-Code an den Puck schicken
+  function sendStreamerCode(){
+    // Wichtig: IDE muss getrennt sein, sonst ist die Konsole belegt.
+    // Dieses Snippet setzt den Stream auf BLE-UART (Bluetooth.println)
+    const code = `
+reset();
+setTimeout(function(){
+  var HZ=12.5, DT=80;
+  Puck.accelOn(HZ);
+  setInterval(function(){
+    var d=Puck.accel(),a=(d&&d.acc)?d.acc:d;
+    if(a) Bluetooth.println((a.x|0)+","+(a.y|0)+","+(a.z|0));
+  }, DT);
+  NRF.on('disconnect', function(){ reset(); });
+}, 500);
+`;
+    // \x03 sendet Ctrl-C, \x10 ist optional, um "IDE"-Modus zu beenden; dann Code + \n
+    connection.write("\x03" + code + "\n");
+  }
+
   $connect.onclick = async () => {
     try{
+      // WICHTIG: Stelle sicher, dass die Espruino Web IDE getrennt ist.
       connection = await UART.connect();
-      // Verbindung offen lassen – NICHT schließen
       setConnectedUI(true);
+
+      // Datenstrom lesen (Zeilenpufferung)
+      connection.on('data', d => {
+        lineBuf += d;
+        const lines = lineBuf.split(/\r?\n/);
+        lineBuf = lines.pop();
+        lines.forEach(handleLine);
+      });
+
+      // Streamer auf dem Puck starten
+      sendStreamerCode();
     }catch(e){
       $status.textContent = "Connect failed: " + e.message;
     }
   };
 
-  $fetch.onclick = () => fetchOnce();
-
-  $auto.onchange = () => {
-    if ($auto.checked){
-      // alle ~1.6 s (20 Samples @ 12.5 Hz)
-      autoTimer = setInterval(fetchOnce, 1600);
-      fetchOnce(); // sofort einmal
-    }else{
-      if (autoTimer){ clearInterval(autoTimer); autoTimer=null; }
-    }
-  };
-
   $disc.onclick = () => {
-    try{
-      if (connection) connection.close();
-    }catch(_){}
-    connection=null;
+    try{ if (connection) connection.close(); }catch(_){}
+    connection = null;
     setConnectedUI(false);
+    lineBuf = ""; sampleBuf = [];
   };
   </script>
 </body>
