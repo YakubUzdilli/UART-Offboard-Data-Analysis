@@ -2,22 +2,26 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>UbiComp Assignment – Offboard (Streaming + Calibration)</title>
+  <title>Off-board Classification</title>
   <style>
     body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 16px}
     button{padding:10px 14px;margin:6px 8px 6px 0}
+    label{margin-left:8px}
+    #sensordata{width:100%;height:90px}
     #status{display:inline-block;margin-left:8px;font-weight:600}
-    #sensordata{width:100%;height:70px}
     #calInfo{margin-left:8px;font-style:italic}
+    canvas{max-width:700px}
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.9.4/Chart.js"></script>
   <script src="model.js"></script>
 </head>
 <body>
-  <h1>Off-board Classification (Live Stream with Calibration)</h1>
+  <h1>Off-board Classification</h1>
 
   <p>
-    <button id="btnConnect">Connect & Start Stream</button>
+    <button id="btnConnect">Connect</button>
+    <button id="btnFetch" disabled>Fetch 20 samples</button>
+    <label><input type="checkbox" id="autoChk" disabled /> Auto (1.6 s)</label>
     <button id="btnDisconnect" disabled>Disconnect</button>
     <span id="status">Not connected</span>
   </p>
@@ -27,14 +31,17 @@
     <span id="calInfo"></span>
   </p>
 
+  <textarea id="sensordata" placeholder="CSV (60 ints: 20×x,y,z) …"></textarea>
   <div id="result" style="margin-top:8px;font-weight:bold;"></div>
-  <textarea id="sensordata" placeholder="Letzte CSV-Zeilen …"></textarea>
-  <canvas id="myChart" style="width:100%;max-width:700px;margin-top:12px;"></canvas>
+  <canvas id="myChart"></canvas>
 
   <!-- UART.js: WebBluetooth helper -->
   <script src="https://www.espruino.com/js/uart.js"></script>
   <script>
+  // ---- UI refs
   const $connect = document.getElementById('btnConnect');
+  const $fetch   = document.getElementById('btnFetch');
+  const $auto    = document.getElementById('autoChk');
   const $disc    = document.getElementById('btnDisconnect');
   const $status  = document.getElementById('status');
   const $sens    = document.getElementById('sensordata');
@@ -42,26 +49,59 @@
   const $cal     = document.getElementById('btnCal');
   const $calInfo = document.getElementById('calInfo');
 
+  // ---- State
   let connection = null;
-  let lineBuf = "";
-  let sampleBuf = []; // hält jeweils 60 Werte (20×x,y,z)
+  let autoTimer = null;
 
-  // Offsets & Kalibrierung
+  // Calibration offsets (auf Werten in ±127)
   let ox=0, oy=0, oz=0;
   let calMode=false, calN=0, sx=0, sy=0, sz=0;
 
   function setConnectedUI(on){
     $connect.disabled = on;
+    $fetch.disabled   = !on;
+    $auto.disabled    = !on;
     $disc.disabled    = !on;
     $cal.disabled     = !on;
-    $status.textContent = on ? "Connected (streaming…)" : "Not connected";
+    $status.textContent = on ? "Connected" : "Not connected";
+
     if (!on){
+      $auto.checked = false;
+      if (autoTimer){ clearInterval(autoTimer); autoTimer=null; }
       $calInfo.textContent = "";
-      sampleBuf=[];
     }
   }
 
-  // ---- Plot
+  // ---- Robustes Parsen: extrahiere nur Zahlen, nimm die letzten 60
+  function parseCSV60(response){
+    if (!response || typeof response !== "string") return null;
+    // Entfernt Prompts/Echo (":"/">") usw. – extrahiert nur ints
+    const nums = (response.match(/-?\d+/g) || []).map(n => parseInt(n,10));
+    if (nums.length < 60) return null;
+    // nimm die letzte volle 60er-Sequenz (falls zusätzliches Zeug im String ist)
+    const arr = nums.slice(-60);
+    return arr.length === 60 ? arr : null;
+  }
+
+  // ---- Klassifikation + Anzeige
+  function doClassification(data){
+    // Kalibrierte Daten anwenden (pro Achse Offsets abziehen)
+    const adj = data.slice(); // copy
+    for (let i=0;i<20;i++){
+      adj[3*i]   = clamp127(adj[3*i]   - ox);
+      adj[3*i+1] = clamp127(adj[3*i+1] - oy);
+      adj[3*i+2] = clamp127(adj[3*i+2] - oz);
+    }
+    const out = classify(adj); // kommt aus model.js
+    const labels = ["random","up-down","sideways"];
+    const idx = out.indexOf(Math.max(...out));
+    $result.textContent = `Classifier: ${labels[idx]}  (raw=[${out.join(", ")}])`;
+    plotWindow(adj);
+  }
+
+  function clamp127(v){ if(v>127)return 127; if(v<-127)return -127; return v|0; }
+
+  // ---- Plot (x/y/z über 20 Samples)
   let chart = null;
   function plotWindow(data){
     const xs=[], ys=[], zs=[];
@@ -86,102 +126,74 @@
     });
   }
 
-  // ---- RAW -> ±127 (±2g)
-  const SCALE = 127/16384;
-  function to127(v){ v = Math.round(v*SCALE); if(v>127)v=127; if(v<-127)v=-127; return v|0; }
-
-  // ---- CSV-Zeilen aus dem Stream verarbeiten
-  function handleLine(l){
-    const parts = l.trim().split(",");
-    if (parts.length !== 3) return;
-
-    const x0 = to127(parseInt(parts[0],10));
-    const y0 = to127(parseInt(parts[1],10));
-    const z0 = to127(parseInt(parts[2],10));
-
-    if (calMode){
-      sx += x0; sy += y0; sz += z0; calN++;
-    }
-
-    // Offsets abziehen
-    const x = Math.max(-127, Math.min(127, x0 - ox));
-    const y = Math.max(-127, Math.min(127, y0 - oy));
-    const z = Math.max(-127, Math.min(127, z0 - oz));
-
-    sampleBuf.push(x,y,z);
-
-    // Textfeld updaten
-    const lines = $sens.value.split(/\r?\n/).slice(-8);
-    lines.push(`${x},${y},${z}`);
-    $sens.value = lines.join("\n");
-
-    if (sampleBuf.length >= 60){
-      const window60 = sampleBuf.slice(0,60);
-      sampleBuf = sampleBuf.slice(60);
-
-      const out = classify(window60); // aus model.js
-      const labels = ["random","up-down","sideways"];
-      const idx = out.indexOf(Math.max(...out));
-      $result.textContent = `Classifier: ${labels[idx]}  (raw=[${out.join(", ")}])`;
-
-      plotWindow(window60);
-    }
+  // ---- Einmal 20 Samples vom Puck holen (Verbindung bleibt offen)
+  function fetchOnce(){
+    UART.eval('dumpData()', function(response) {
+      // Textarea updaten
+      $sens.value = response || "";
+      const data = parseCSV60(response);
+      if (!data){
+        $result.textContent = "Zu wenig Daten – kurz warten und erneut klicken.";
+        return;
+      }
+      // Wenn gerade Kalibrierung aktiv: Mittel der 60er-Fenster sammeln
+      if (calMode){
+        let sxw=0, syw=0, szw=0;
+        for (let i=0;i<20;i++){
+          sxw += data[3*i]; syw += data[3*i+1]; szw += data[3*i+2];
+        }
+        sx += Math.round(sxw/20);
+        sy += Math.round(syw/20);
+        sz += Math.round(szw/20);
+        calN++;
+      }
+      doClassification(data);
+    });
   }
 
-  // ---- Streaming-Code an den Puck schicken
-  function sendStreamerCode(){
-    const code = `
-reset();
-setTimeout(function(){
-  var HZ=12.5, DT=80;
-  Puck.accelOn(HZ);
-  setInterval(function(){
-    var d=Puck.accel(),a=(d&&d.acc)?d.acc:d;
-    if(a) Bluetooth.println((a.x|0)+","+(a.y|0)+","+(a.z|0));
-  }, DT);
-  NRF.on('disconnect', function(){ reset(); });
-}, 500);
-`;
-    connection.write("\x03" + code + "\n");
-  }
-
-  $connect.onclick = async () => {
+  // ---- Events
+  document.getElementById('btnConnect').onclick = async () => {
     try{
+      // Stelle sicher, dass die Espruino Web IDE getrennt ist.
       connection = await UART.connect();
       setConnectedUI(true);
-      connection.on('data', d => {
-        lineBuf += d;
-        const lines = lineBuf.split(/\r?\n/);
-        lineBuf = lines.pop();
-        lines.forEach(handleLine);
-      });
-      sendStreamerCode();
     }catch(e){
       $status.textContent = "Connect failed: " + e.message;
     }
   };
 
-  $disc.onclick = () => {
+  document.getElementById('btnFetch').onclick = () => fetchOnce();
+
+  document.getElementById('autoChk').onchange = () => {
+    if ($auto.checked){
+      autoTimer = setInterval(fetchOnce, 1600); // 20 Samples @12.5 Hz
+      fetchOnce();
+    } else {
+      if (autoTimer){ clearInterval(autoTimer); autoTimer=null; }
+    }
+  };
+
+  document.getElementById('btnDisconnect').onclick = () => {
     try{ if (connection) connection.close(); }catch(_){}
     connection = null;
     setConnectedUI(false);
-    lineBuf=""; sampleBuf=[];
   };
 
-  // ---- Calibration
-  $cal.onclick = () => {
+  // ---- Kalibrierung
+  document.getElementById('btnCal').onclick = () => {
+    // ~1 s Sammeln (bei Auto kannst du sie anlassen)
     calMode = true; calN=0; sx=sy=sz=0;
     $calInfo.textContent = "Calibrating… keep still";
     setTimeout(()=>{
       if (calN>0){
-        ox=Math.round(sx/calN);
-        oy=Math.round(sy/calN);
-        oz=Math.round(sz/calN);
+        ox = Math.round(sx/calN);
+        oy = Math.round(sy/calN);
+        oz = Math.round(sz/calN);
         $calInfo.textContent = `Offsets set: ox=${ox}, oy=${oy}, oz=${oz}`;
-      }else{
-        $calInfo.textContent = "Calibration failed.";
+      } else {
+        $calInfo.textContent = "Calibration failed (no samples).";
       }
-      calMode=false;
+      calMode = false;
     }, 1200);
   };
   </script>
