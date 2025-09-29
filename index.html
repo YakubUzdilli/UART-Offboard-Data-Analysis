@@ -31,14 +31,14 @@
     <span id="calInfo"></span>
   </p>
 
-  <textarea id="sensordata" placeholder="CSV (60 ints: 20×x,y,z) …"></textarea>
+  <textarea id="sensordata" placeholder="Letzte CSV-Zeilen …"></textarea>
   <div id="result" style="margin-top:8px;font-weight:bold;"></div>
   <canvas id="myChart"></canvas>
 
-  <!-- UART.js: WebBluetooth helper -->
+  <!-- UART.js (WebBluetooth helper) -->
   <script src="https://www.espruino.com/js/uart.js"></script>
   <script>
-  // ---- UI refs
+  // UI refs
   const $connect = document.getElementById('btnConnect');
   const $fetch   = document.getElementById('btnFetch');
   const $auto    = document.getElementById('autoChk');
@@ -49,11 +49,13 @@
   const $cal     = document.getElementById('btnCal');
   const $calInfo = document.getElementById('calInfo');
 
-  // ---- State
+  // State
   let connection = null;
   let autoTimer = null;
+  let lineBuf = "";
+  let sampleBuf = []; // hält kontinuierlich die letzten 60 Werte (20×x,y,z)
 
-  // Calibration offsets (auf Werten in ±127)
+  // Kalibrierung (Offsets in ±127)
   let ox=0, oy=0, oz=0;
   let calMode=false, calN=0, sx=0, sy=0, sz=0;
 
@@ -63,45 +65,21 @@
     $auto.disabled    = !on;
     $disc.disabled    = !on;
     $cal.disabled     = !on;
-    $status.textContent = on ? "Connected" : "Not connected";
-
+    $status.textContent = on ? "Connected (streaming…)" : "Not connected";
     if (!on){
       $auto.checked = false;
       if (autoTimer){ clearInterval(autoTimer); autoTimer=null; }
       $calInfo.textContent = "";
+      lineBuf=""; sampleBuf=[];
     }
   }
 
-  // ---- Robustes Parsen: extrahiere nur Zahlen, nimm die letzten 60
-  function parseCSV60(response){
-    if (!response || typeof response !== "string") return null;
-    // Entfernt Prompts/Echo (":"/">") usw. – extrahiert nur ints
-    const nums = (response.match(/-?\d+/g) || []).map(n => parseInt(n,10));
-    if (nums.length < 60) return null;
-    // nimm die letzte volle 60er-Sequenz (falls zusätzliches Zeug im String ist)
-    const arr = nums.slice(-60);
-    return arr.length === 60 ? arr : null;
-  }
-
-  // ---- Klassifikation + Anzeige
-  function doClassification(data){
-    // Kalibrierte Daten anwenden (pro Achse Offsets abziehen)
-    const adj = data.slice(); // copy
-    for (let i=0;i<20;i++){
-      adj[3*i]   = clamp127(adj[3*i]   - ox);
-      adj[3*i+1] = clamp127(adj[3*i+1] - oy);
-      adj[3*i+2] = clamp127(adj[3*i+2] - oz);
-    }
-    const out = classify(adj); // kommt aus model.js
-    const labels = ["random","up-down","sideways"];
-    const idx = out.indexOf(Math.max(...out));
-    $result.textContent = `Classifier: ${labels[idx]}  (raw=[${out.join(", ")}])`;
-    plotWindow(adj);
-  }
-
+  // RAW->±127
+  const SCALE = 127/16384;
+  function to127(v){ v = Math.round(v*SCALE); if(v>127)v=127; if(v<-127)v=-127; return v|0; }
   function clamp127(v){ if(v>127)return 127; if(v<-127)return -127; return v|0; }
 
-  // ---- Plot (x/y/z über 20 Samples)
+  // Plot
   let chart = null;
   function plotWindow(data){
     const xs=[], ys=[], zs=[];
@@ -126,62 +104,101 @@
     });
   }
 
-  // ---- Einmal 20 Samples vom Puck holen (Verbindung bleibt offen)
-  function fetchOnce(){
-    UART.eval('dumpData()', function(response) {
-      // Textarea updaten
-      $sens.value = response || "";
-      const data = parseCSV60(response);
-      if (!data){
-        $result.textContent = "Zu wenig Daten – kurz warten und erneut klicken.";
-        return;
-      }
-      // Wenn gerade Kalibrierung aktiv: Mittel der 60er-Fenster sammeln
-      if (calMode){
-        let sxw=0, syw=0, szw=0;
-        for (let i=0;i<20;i++){
-          sxw += data[3*i]; syw += data[3*i+1]; szw += data[3*i+2];
-        }
-        sx += Math.round(sxw/20);
-        sy += Math.round(syw/20);
-        sz += Math.round(szw/20);
-        calN++;
-      }
-      doClassification(data);
-    });
+  // Zeilen aus dem Stream verarbeiten
+  function handleLine(l){
+    const parts = l.trim().split(",");
+    if (parts.length !== 3) return;
+    const x0 = to127(parseInt(parts[0],10));
+    const y0 = to127(parseInt(parts[1],10));
+    const z0 = to127(parseInt(parts[2],10));
+
+    if (calMode){ sx+=x0; sy+=y0; sz+=z0; calN++; }
+
+    // Offsets abziehen
+    const x = clamp127(x0 - ox), y = clamp127(y0 - oy), z = clamp127(z0 - oz);
+
+    // In den Ringpuffer: nur die letzten 60 Werte behalten
+    sampleBuf.push(x,y,z);
+    if (sampleBuf.length > 60) sampleBuf = sampleBuf.slice(sampleBuf.length-60);
+
+    // Textarea: letzte CSV-Zeilen zeigen
+    const lines = $sens.value.split(/\r?\n/).slice(-8);
+    lines.push(`${x},${y},${z}`);
+    $sens.value = lines.join("\n");
   }
 
-  // ---- Events
-  document.getElementById('btnConnect').onclick = async () => {
+  // Klassifikation eines 20×3 Fensters
+  function classifyCurrentWindow(){
+    if (sampleBuf.length < 60){
+      $result.textContent = "Zu wenig Daten – kurz warten …";
+      return;
+    }
+    const window60 = sampleBuf.slice(-60); // aktuelles Fenster
+    const out = classify(window60); // aus model.js
+    const labels = ["random","up-down","sideways"];
+    const idx = out.indexOf(Math.max(...out));
+    $result.textContent = `Classifier: ${labels[idx]}  (raw=[${out.join(", ")}])`;
+    plotWindow(window60);
+  }
+
+  // Streaming-Code an den Puck schicken (läuft bis Disconnect)
+  function sendStreamerCode(){
+    const code = `
+reset();
+setTimeout(function(){
+  var HZ=12.5, DT=80;
+  Puck.accelOn(HZ);
+  setInterval(function(){
+    var d=Puck.accel(),a=(d&&d.acc)?d.acc:d;
+    if(a) Bluetooth.println((a.x|0)+","+(a.y|0)+","+(a.z|0));
+  }, DT);
+  NRF.on('disconnect', function(){ reset(); });
+}, 300);
+`;
+    connection.write("\x03" + code + "\n"); // Ctrl-C, dann Code
+  }
+
+  // Events
+  $connect.onclick = async () => {
     try{
-      // Stelle sicher, dass die Espruino Web IDE getrennt ist.
+      // Wichtig: Espruino Web IDE muss getrennt sein.
       connection = await UART.connect();
       setConnectedUI(true);
+
+      // Datenstrom lesen
+      connection.on('data', d => {
+        lineBuf += d;
+        const lines = lineBuf.split(/\r?\n/);
+        lineBuf = lines.pop();
+        lines.forEach(handleLine);
+      });
+
+      // Stream auf dem Puck starten
+      sendStreamerCode();
     }catch(e){
       $status.textContent = "Connect failed: " + e.message;
     }
   };
 
-  document.getElementById('btnFetch').onclick = () => fetchOnce();
+  $fetch.onclick = () => classifyCurrentWindow();
 
-  document.getElementById('autoChk').onchange = () => {
+  $auto.onchange = () => {
     if ($auto.checked){
-      autoTimer = setInterval(fetchOnce, 1600); // 20 Samples @12.5 Hz
-      fetchOnce();
-    } else {
+      autoTimer = setInterval(classifyCurrentWindow, 1600); // ~20 Samples @12.5 Hz
+      classifyCurrentWindow();
+    }else{
       if (autoTimer){ clearInterval(autoTimer); autoTimer=null; }
     }
   };
 
-  document.getElementById('btnDisconnect').onclick = () => {
+  $disc.onclick = () => {
     try{ if (connection) connection.close(); }catch(_){}
-    connection = null;
+    connection=null;
     setConnectedUI(false);
   };
 
-  // ---- Kalibrierung
-  document.getElementById('btnCal').onclick = () => {
-    // ~1 s Sammeln (bei Auto kannst du sie anlassen)
+  // Kalibrierung
+  $cal.onclick = () => {
     calMode = true; calN=0; sx=sy=sz=0;
     $calInfo.textContent = "Calibrating… keep still";
     setTimeout(()=>{
