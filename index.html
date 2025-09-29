@@ -2,23 +2,29 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>UbiComp Assignment – Offboard (Streaming)</title>
+  <title>UbiComp Assignment – Offboard (Streaming + Calibration)</title>
   <style>
     body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 16px}
     button{padding:10px 14px;margin:6px 8px 6px 0}
     #status{display:inline-block;margin-left:8px;font-weight:600}
     #sensordata{width:100%;height:70px}
+    #calInfo{margin-left:8px;font-style:italic}
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.9.4/Chart.js"></script>
   <script src="model.js"></script>
 </head>
 <body>
-  <h1>Off-board Classification (Live Stream)</h1>
+  <h1>Off-board Classification (Live Stream with Calibration)</h1>
 
   <p>
     <button id="btnConnect">Connect & Start Stream</button>
     <button id="btnDisconnect" disabled>Disconnect</button>
     <span id="status">Not connected</span>
+  </p>
+
+  <p>
+    <button id="btnCal" disabled>Calibrate (hold still ~1s)</button>
+    <span id="calInfo"></span>
   </p>
 
   <div id="result" style="margin-top:8px;font-weight:bold;"></div>
@@ -33,15 +39,26 @@
   const $status  = document.getElementById('status');
   const $sens    = document.getElementById('sensordata');
   const $result  = document.getElementById('result');
+  const $cal     = document.getElementById('btnCal');
+  const $calInfo = document.getElementById('calInfo');
 
   let connection = null;
   let lineBuf = "";
   let sampleBuf = []; // hält jeweils 60 Werte (20×x,y,z)
 
+  // Offsets & Kalibrierung
+  let ox=0, oy=0, oz=0;
+  let calMode=false, calN=0, sx=0, sy=0, sz=0;
+
   function setConnectedUI(on){
     $connect.disabled = on;
     $disc.disabled    = !on;
+    $cal.disabled     = !on;
     $status.textContent = on ? "Connected (streaming…)" : "Not connected";
+    if (!on){
+      $calInfo.textContent = "";
+      sampleBuf=[];
+    }
   }
 
   // ---- Plot
@@ -69,45 +86,50 @@
     });
   }
 
-  // ---- RAW -> ±127 (±2g) wie im Assignment
+  // ---- RAW -> ±127 (±2g)
   const SCALE = 127/16384;
   function to127(v){ v = Math.round(v*SCALE); if(v>127)v=127; if(v<-127)v=-127; return v|0; }
 
   // ---- CSV-Zeilen aus dem Stream verarbeiten
   function handleLine(l){
-    // erwartet "x,y,z" (RAW ints)
     const parts = l.trim().split(",");
     if (parts.length !== 3) return;
-    const x = to127(parseInt(parts[0],10));
-    const y = to127(parseInt(parts[1],10));
-    const z = to127(parseInt(parts[2],10));
+
+    const x0 = to127(parseInt(parts[0],10));
+    const y0 = to127(parseInt(parts[1],10));
+    const z0 = to127(parseInt(parts[2],10));
+
+    if (calMode){
+      sx += x0; sy += y0; sz += z0; calN++;
+    }
+
+    // Offsets abziehen
+    const x = Math.max(-127, Math.min(127, x0 - ox));
+    const y = Math.max(-127, Math.min(127, y0 - oy));
+    const z = Math.max(-127, Math.min(127, z0 - oz));
+
     sampleBuf.push(x,y,z);
 
-    // Zeige die letzten paar CSVs im Textfeld
+    // Textfeld updaten
     const lines = $sens.value.split(/\r?\n/).slice(-8);
-    lines.push(l.trim());
+    lines.push(`${x},${y},${z}`);
     $sens.value = lines.join("\n");
 
-    // Wenn 60 Werte (20 Samples) voll sind: klassifizieren & Puffer leeren
     if (sampleBuf.length >= 60){
       const window60 = sampleBuf.slice(0,60);
-      sampleBuf = sampleBuf.slice(60); // Falls du gleitendes Fenster willst, ändere das auf slice(3) usw.
+      sampleBuf = sampleBuf.slice(60);
 
-      // Klassifizieren
       const out = classify(window60); // aus model.js
       const labels = ["random","up-down","sideways"];
       const idx = out.indexOf(Math.max(...out));
       $result.textContent = `Classifier: ${labels[idx]}  (raw=[${out.join(", ")}])`;
 
-      // Plot
       plotWindow(window60);
     }
   }
 
-  // ---- Beim Connect: Streaming-Code an den Puck schicken
+  // ---- Streaming-Code an den Puck schicken
   function sendStreamerCode(){
-    // Wichtig: IDE muss getrennt sein, sonst ist die Konsole belegt.
-    // Dieses Snippet setzt den Stream auf BLE-UART (Bluetooth.println)
     const code = `
 reset();
 setTimeout(function(){
@@ -120,25 +142,19 @@ setTimeout(function(){
   NRF.on('disconnect', function(){ reset(); });
 }, 500);
 `;
-    // \x03 sendet Ctrl-C, \x10 ist optional, um "IDE"-Modus zu beenden; dann Code + \n
     connection.write("\x03" + code + "\n");
   }
 
   $connect.onclick = async () => {
     try{
-      // WICHTIG: Stelle sicher, dass die Espruino Web IDE getrennt ist.
       connection = await UART.connect();
       setConnectedUI(true);
-
-      // Datenstrom lesen (Zeilenpufferung)
       connection.on('data', d => {
         lineBuf += d;
         const lines = lineBuf.split(/\r?\n/);
         lineBuf = lines.pop();
         lines.forEach(handleLine);
       });
-
-      // Streamer auf dem Puck starten
       sendStreamerCode();
     }catch(e){
       $status.textContent = "Connect failed: " + e.message;
@@ -149,7 +165,24 @@ setTimeout(function(){
     try{ if (connection) connection.close(); }catch(_){}
     connection = null;
     setConnectedUI(false);
-    lineBuf = ""; sampleBuf = [];
+    lineBuf=""; sampleBuf=[];
+  };
+
+  // ---- Calibration
+  $cal.onclick = () => {
+    calMode = true; calN=0; sx=sy=sz=0;
+    $calInfo.textContent = "Calibrating… keep still";
+    setTimeout(()=>{
+      if (calN>0){
+        ox=Math.round(sx/calN);
+        oy=Math.round(sy/calN);
+        oz=Math.round(sz/calN);
+        $calInfo.textContent = `Offsets set: ox=${ox}, oy=${oy}, oz=${oz}`;
+      }else{
+        $calInfo.textContent = "Calibration failed.";
+      }
+      calMode=false;
+    }, 1200);
   };
   </script>
 </body>
