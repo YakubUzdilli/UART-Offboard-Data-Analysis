@@ -1,0 +1,108 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Puck.js Offboard ANN</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; }
+    button { padding: 10px 14px; margin: 6px 8px 6px 0; }
+    #log { white-space: pre-wrap; background:#f7f7f7; padding:12px; border-radius:8px; min-height: 80px;}
+    .pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#eee;margin-left:8px;}
+  </style>
+</head>
+<body>
+  <h1>Puck.js Offboard ANN</h1>
+  <p>
+    <button id="btnConnect">Connect</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+  </p>
+  <p>
+    <strong>Status:</strong> <span id="status">Idle</span>
+    <span id="count" class="pill">samples: 0</span>
+  </p>
+  <div id="log"></div>
+
+  <!-- UART.js: WebBluetooth/WebSerial Helper -->
+  <script src="https://www.espruino.com/js/uart.js"></script>
+  <!-- Dein bereits geliefertes ANN (Infxl.*) -->
+  <script src="model.js"></script>
+  <script>
+  // === Einstellungen gemäß Assignment ===
+  const N = 20;           // Samples pro Fenster
+  const SCALE = 127/16384;// RAW -> ±127 (±2g) wie Onboard
+  function clamp127(v){ return v>127?127:(v<-127?-127:v|0); }
+
+  // === App-State ===
+  let connection = null;
+  let lineBuf = "";
+  let i = 0; // Sample-Index im Fenster
+  const $status = document.getElementById('status');
+  const $count  = document.getElementById('count');
+  const $log    = document.getElementById('log');
+
+  function setStatus(t){ $status.textContent = t; }
+  function logln(t){ $log.textContent += t + "\n"; $log.scrollTop = $log.scrollHeight; }
+
+  // --- CSV -> ints -> ±127 skalieren, ins Modell schieben ---
+  function handleCSVLine(l){
+    // Erwartet: "x,y,z"
+    const parts = l.trim().split(",");
+    if (parts.length !== 3) return;
+    let x = clamp127(Math.round(parseInt(parts[0],10) * SCALE));
+    let y = clamp127(Math.round(parseInt(parts[1],10) * SCALE));
+    let z = clamp127(Math.round(parseInt(parts[2],10) * SCALE));
+
+    // Infxl: gleiches Interface wie bei deinem Onboard-Code
+    Infxl.insert(i, x, y, z);
+    i++;
+    $count.textContent = "samples: " + i;
+
+    if (i === N){
+      const cls = Infxl.model();   // -> 0=random,1=up-down,2=sideways (gemäß Model)
+      logln("Klassifikation: " + cls);
+      i = 0;
+      $count.textContent = "samples: 0";
+    }
+  }
+
+  // --- Verbindungsaufbau & Datenempfang ---
+  document.getElementById('btnConnect').onclick = async () => {
+    try {
+      setStatus("Verbinde …");
+      // UART.connect gibt eine Connection zurück, ähnlich wie Puck.connect
+      // (HTTPS ist Voraussetzung – z. B. GitHub Pages)
+      connection = await UART.connect();
+      setStatus("Verbunden");
+      document.getElementById('btnDisconnect').disabled = false;
+
+      // Datenstrom (Zeilenpufferung)
+      connection.on('data', d => {
+        lineBuf += d;
+        const lines = lineBuf.split("\n");
+        lineBuf = lines.pop(); // letzte unvollständige Zeile stehen lassen
+        lines.forEach(handleCSVLine);
+      });
+
+      // (Optional) Puck-Seite fernstarten: Code dort laufen lassen
+      // Wir starten KEINEN neuen Interval, weil dein Puck ja schon streamt.
+      // Falls du aus dem Browser starten willst, könntest du so etwas senden:
+      // UART.write("Puck.accelOn(12.5);clearInterval();setInterval(()=>{var a=Puck.accel().acc;Bluetooth.println([a.x|0,a.y|0,a.z|0].join(','));},80);NRF.on('disconnect',()=>reset());\n");
+
+      logln("Bereit. Warte auf CSV-Zeilen …");
+    } catch (e){
+      setStatus("Fehler: " + e.message);
+    }
+  };
+
+  document.getElementById('btnDisconnect').onclick = () => {
+    try {
+      if (connection) connection.close();
+    } finally {
+      connection = null;
+      setStatus("Getrennt");
+      document.getElementById('btnDisconnect').disabled = true;
+    }
+  };
+  </script>
+</body>
+</html>
