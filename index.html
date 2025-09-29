@@ -78,7 +78,7 @@
       // Datenstrom (Zeilenpufferung)
       connection.on('data', d => {
         lineBuf += d;
-        const lines = lineBuf.split("\n");
+        const lines = lineBuf.split("/\r?\n/"); // CRLF oder LF
         lineBuf = lines.pop(); // letzte unvollständige Zeile stehen lassen
         lines.forEach(handleCSVLine);
       });
